@@ -2,11 +2,12 @@
 
 -- port or socket path to listen to
 listen = ":9000"
+--listen = "/var/tmp/luafcgid.socket"
 
 -- number of worker threads
 workers = 3
 
--- max number of Lua VM states
+-- max number of Lua VM states (Note this value needs to be larger then or equal to "workers")
 states = 5
 
 -- number of clones of each script allowed

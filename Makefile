@@ -1,16 +1,25 @@
 # Lua setup
 BASE = /usr/local
-LUAINC = $(BASE)/include/lua51
-LUALIB = $(BASE)/lib/lua51
+
+## for Lua 5.1.x
+#LUAINC = $(BASE)/include/lua51
+#LUALIB = $(BASE)/lib/lua51
+#LUA_LIBS = -llua
+
+## for LuaJIT2
+LUAINC = $(BASE)/include/luajit-2.0
+LUALIB = $(BASE)/lib
+LUA_LIBS = -lluajit-5.1
 
 # basic setup
 CC = gcc
 WARN = -Wall
 INCS = -I$(BASE)/include -I$(LUAINC)
-LIBS = -L$(BASE)/lib -L$(LUALIB) -lm -lpthread -lfcgi -llua
+LIBS = -L$(BASE)/lib -L$(LUALIB) -lm -lpthread -lfcgi $(LUA_LIBS)
 INSTALL_DIR = $(BASE)/bin
 #DEBUG = -ggdb
 OPTS = -O2
+#OPTS = -O3 -march=native
 CFLAGS = $(INCS) $(WARN) $(OPTS) $(DEBUG) $G
 LDFLAGS = $(LIBS) $(OPTS) $(DEBUG)
 
