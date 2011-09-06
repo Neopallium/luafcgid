@@ -5,48 +5,31 @@
  * (c) STPeters 2009
  */
 
-
 #include "main.h"
 
-#define ERR_SIZE 1024
+const char* CRLF = "\r\n";
 
-const char* env_var[] = {
-    // standard CGI environment variables as per CGI Specification 1.1
-    "SERVER_SOFTWARE",
-    "SERVER_NAME",
-    "GATEWAY_INTERFACE",
-    "SERVER_PROTOCOL",
-    "SERVER_PORT",
-    "REQUEST_METHOD",
-    "PATH_INFO",
-    "PATH_TRANSLATED",
-    "SCRIPT_NAME",
-    "QUERY_STRING",
-    "REMOTE_HOST",
-    "REMOTE_ADDR",
-    "AUTH_TYPE",
-    "REMOTE_USER",
-    "REMOTE_IDENT",
-    "CONTENT_TYPE",
-    "CONTENT_LENGTH", // WARNING! do NOT rely on this value
-    // common client variables
-    "HTTP_ACCEPT",
-    "HTTP_USER_AGENT",
-    // not spec, but required for this to work
-    "SCRIPT_FILENAME",
-    NULL,
-};
+/* utility functions */
 
-// utility functions
+BOOL luaL_getglobal_bool(lua_State* L, const char* name, BOOL* v) {
+	lua_getglobal(L, name);
+	if (lua_isboolean(L, -1)) {
+		*v = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		return TRUE;
+	}
+	lua_pop(L, 1);
+	return FALSE;
+}
 
 BOOL luaL_getglobal_int(lua_State* L, const char* name, int* v) {
 	lua_getglobal(L, name);
 	if (lua_isnumber(L, -1)) {
-        *v = lua_tointeger(L, -1);
-        lua_pop(L, 1);
-        return TRUE;
+		*v = lua_tointeger(L, -1);
+		lua_pop(L, 1);
+		return TRUE;
 	}
-    lua_pop(L, 1);
+	lua_pop(L, 1);
 	return FALSE;
 }
 
@@ -55,53 +38,103 @@ BOOL luaL_getglobal_str(lua_State* L, const char* name, char** v) {
 	size_t l = 0;
 	lua_getglobal(L, name);
 	if (lua_isstring(L, -1)) {
-        r = lua_tolstring(L, -1, &l);
-        if (r && l) {
-        	if (*v) free(*v);
-        	*v = (char*)malloc(l + 1);
-        	strncpy(*v, r, l);
-        	(*v)[l] = '\0';
+		r = lua_tolstring(L, -1, &l);
+		if (r && l) {
+			if (*v)
+				free(*v);
+			*v = (char*) malloc(l + 1);
+			strncpy(*v, r, l);
+			(*v)[l] = '\0';
 			lua_pop(L, 1);
-        	return TRUE;
-        }
+			return TRUE;
+		}
 	}
-    lua_pop(L, 1);
+	lua_pop(L, 1);
 	return FALSE;
 }
 
 void luaL_pushcgienv(lua_State* L, request_t* r) {
-    int i = 0;
-    char* v = NULL;
-    lua_newtable(L);
-    lua_pushinteger(L, LUAFCGID_VERSION);
-    lua_setfield(L, -2, "LUAFCGID_VERSION");
-    while(env_var[i]) {
-        v = FCGX_GetParam(env_var[i], r->fcgi.envp);
-        if (v) {
-            lua_pushstring(L, env_var[i]);
-            lua_pushstring(L, v);
-            lua_settable(L, -3);
-        }
-        i++;
-    }
+	char** p = r->fcgi.envp;
+	char* v = NULL;
+	/* create new table on the stack */
+	lua_newtable(L);
+	/* add gratuitous version info */
+	lua_pushinteger(L, LUAFCGID_VERSION);
+	lua_setfield(L, -2, "LUAFCGID_VERSION");
+	/* iterate over the FCGI envp structure */
+	if (p == NULL) return;
+	while (*p) {
+		/* string is in format 'name=value' */
+		v = strchr(*p, '=');
+		if (v) {
+			lua_pushlstring(L, *p, v-*p);
+			lua_pushstring(L, ++v);
+			lua_settable(L, -3);
+		}
+		p++;
+	}
 }
 
 void luaL_pushcgicontent(lua_State* L, request_t* r) {
-    char* buf = NULL;
-    int size = r->conf->maxpost;
-    size_t len = size;
-    char* slen = FCGX_GetParam("CONTENT_LENGTH", r->fcgi.envp);
+	size_t buf_size = 1024;
+	size_t buf_len = 0;
+	int len;
+	int max = r->conf->maxpost;
+	char* buf = (char*)malloc(buf_size);
+	void* newbuf = NULL;
+	if (!buf) return;
+	/* we don't trust CONTENT_LENGTH, due to various broke HTTP clients */
+	do {
+		/* check buffer size, grow if needed */
+		if ((buf_len + 1024) > buf_size) {
+			buf_size = buf_size * 2;
+			newbuf = realloc((void*)buf, buf_size);
+			if (newbuf) {
+				buf = (char*)newbuf;
+			} else {
+				return;
+			}
+		}
+		/* read a block in */
+		len = FCGX_GetStr(buf + buf_len, 1024, r->fcgi.in);
+		buf_len = buf_len + len;
+	} while ((len == 1024) && (buf_len < max)) ;
+	/* push buffer */
+	if (buf_len) lua_pushlstring(L, buf, buf_len);
+	if (buf) free(buf);
+}
 
-    // check if content length is provided
-    if (slen) len = atoi(slen);
-    if (len > size) len = size;
-    // alloc and zero buffer
-    buf = (char*)malloc(len);
-    memset(buf, 0, len);
-    // load and push buffer
-    FCGX_GetStr(buf, len, r->fcgi.in);
-    lua_pushlstring(L, buf, len);
-    free(buf);
+void send_header(request_t* req) {
+	/* generate minimum headers */
+	char* header = malloc(strlen(req->httpstatus) + strlen(req->contenttype) + 27);
+	if (!header) {
+		logit("out of memory!");
+		return;
+	}
+	sprintf(header, "Status: %s\r\n" \
+			"Content-Type: %s\r\n",
+			req->httpstatus,
+			req->contenttype);
+	FCGX_PutStr(header, strlen(header), req->fcgi.out);
+	free(header);
+	/* output any global custom headers */
+	if (req->conf->headers)
+		FCGX_PutStr(req->conf->headers, strlen(req->conf->headers), req->fcgi.out);
+	/* output any local custom headers */
+	if (req->header.len)
+		FCGX_PutStr(req->header.data, req->header.len, req->fcgi.out);
+	/* don't forget the CRLF terminator */
+	FCGX_PutStr(CRLF, strlen(CRLF), req->fcgi.out);
+	req->headers_sent = TRUE;
+}
+
+void send_body(request_t* req) {
+	/* make sure headers have been sent first */
+	if (!req->headers_sent)
+		send_header(req);
+	/* send buffered body if available */
+	if (req->body.len > 0)
+		FCGX_PutStr(req->body.data, req->body.len, req->fcgi.out);
 }
 
 char* script_load(const char* fn, struct stat* fs) {
@@ -114,7 +147,7 @@ char* script_load(const char* fn, struct stat* fs) {
 		if (S_ISREG(fs->st_mode) && fs->st_size) {
 			fp = fopen(fn, "rb");
 			if (fp) {
-				fbuf = (char*)malloc(fs->st_size);
+				fbuf = (char*) malloc(fs->st_size);
 				memset(fbuf, 0, fs->st_size);
 				fread(fbuf, fs->st_size, 1, fp);
 				fclose(fp);
@@ -139,80 +172,107 @@ void timestamp(char* ts) {
 
 // log a string and vars with a timestamp
 void logit(const char* fmt, ...) {
-    va_list args;
-    char ts[20] = {'\0'};
-    char *str = NULL;
-    // make a copy and add the timestamp
-    str = (char*)malloc(20 + strlen(fmt) + 2);
-    timestamp(ts);
-    sprintf(str, "%s %s\n", ts, fmt);
-    // we just let stderr route it
-    va_start(args, fmt);
-    vfprintf(stderr, str, args);
-    fflush(stderr);
-    va_end(args);
-    free(str);
+	va_list args;
+	char ts[20] = { '\0' };
+	char *str = NULL;
+	// make a copy and add the timestamp
+	str = (char*) malloc(20 + strlen(fmt) + 2);
+	timestamp(ts);
+	sprintf(str, "%s %s\n", ts, fmt);
+	// we just let stderr route it
+	va_start(args, fmt);
+	vfprintf(stderr, str, args);
+	fflush(stderr);
+	va_end(args);
+	free(str);
 }
 
-// worker and parent threads
-
+/* worker thread */
 static void *worker_run(void *a) {
-	// shared vars
+	/* shared vars */
 	static pthread_mutex_t accept_mutex = PTHREAD_MUTEX_INITIALIZER;
-	static pthread_mutex_t lua_mutex = PTHREAD_MUTEX_INITIALIZER;
-	// local private vars
-    int rc, i, j, k;
-    char errtype[ERR_STR_SIZE + 1];
-    char errmsg[ERR_SIZE + 1];
-	params_t* params = (params_t*)a;
+	/* static pthread_mutex_t lua_mutex = PTHREAD_MUTEX_INITIALIZER; */
+
+	/* local private vars */
+	int rc, i;
+	char errtype[ERR_STR_SIZE + 1];
+	char errmsg[ERR_SIZE + 1];
+	params_t* params = (params_t*) a;
 	pool_t* pool = params->pool;
 	slot_t* slot = NULL;
-    request_t req;
-    char* script = NULL;
-    char* split = NULL;
+	int found = -1;
+	request_t req;
+	char* script = NULL;
+	size_t script_len = 0;
+	char* split = NULL;
 	lua_State* L = NULL;
-    struct stat fs;
+	struct stat fs;
 	char* fbuf = NULL;
-	int clones = 0;
-	BOOL flag = FALSE;
 
-	#ifdef CHATTER
+	/* output buffering */
+	buffer_alloc(&req.header, (size_t)params->conf->headersize);
+	buffer_alloc(&req.body, (size_t)params->conf->bodysize);
+
+	/* check allocs */
+	if (!req.header.data || !req.body.data) {
+		logit("out of memory!");
+		return NULL;
+	}
+
+#ifdef CHATTER
 	logit("[%d] starting", params->wid);
-	#endif
+#endif
 
-    FCGX_InitRequest(&req.fcgi, params->sock, 0);
-    req.wid = params->wid;
-    req.conf = params->conf;
+	/* init request */
+	FCGX_InitRequest(&req.fcgi, params->sock, 0);
+	req.wid = params->wid;
+	req.conf = params->conf;
+	req.httpstatus[127] = '\0';
+	req.contenttype[127] = '\0';
 
-    for (;;) {
+	/* request loop */
+	for (;;) {
 
-        // use accept() serialization
-        pthread_mutex_lock(&accept_mutex);
-        rc = FCGX_Accept_r(&req.fcgi);
-        pthread_mutex_unlock(&accept_mutex);
+		/* reset output buffers */
+		req.header.len = 0;
+		req.body.len = 0;
+		req.headers_sent = FALSE;
 
-        if (rc < 0) break;
+		/* copy local config from global */
+		req.buffering = req.conf->buffering;
+		strncpy(req.httpstatus, req.conf->httpstatus, 127);
+		strncpy(req.contenttype, req.conf->contenttype, 127);
 
-		#ifdef CHATTER
+		/* use accept() serialization */
+		pthread_mutex_lock(&accept_mutex);
+		rc = FCGX_Accept_r(&req.fcgi); /* blocking call */
+		pthread_mutex_unlock(&accept_mutex);
+
+		/* SIGTERM */
+		if (rc < 0)
+			break;
+
+#ifdef CHATTER
 		logit("[%d] accepting connection", params->wid);
-		#endif
+#endif
 
-		// init loop locals
+		/* init loop vars */
 		script = FCGX_GetParam("SCRIPT_FILENAME", req.fcgi.envp);
+		script_len = strlen(script);
 		rc = STATUS_404;
 		errmsg[0] = '\0';
+		L = NULL;
 		slot = NULL;
 
 		if (script) {
-			#ifdef _WIN32
-			// normalize path seperator
-			j = strlen(script);
-			for (i = 0; i < j; i++) {
+#ifdef _WIN32
+			/* normalize path seperator */
+			for (i = 0; i < script_len; i++) {
 				if (script[i] == '/') script[i] = SEP;
 			}
-			#endif
-			// isolate the path in the script filename,
-			// and change the cwd to it
+#endif
+			/* isolate the path in the script filename, */
+			/* and change the cwd to it */
 			split = strrchr(script, SEP);
 			if (split) {
 				*split = '\0';
@@ -221,61 +281,40 @@ static void *worker_run(void *a) {
 			}
 		}
 
-		// search for script
-        j = pool->count;
-        k = 0;
-        flag = FALSE;
+		/* search for script in the state pool */
+		i = 0;
 		do {
-			// give someone else a chance to flag out
-			if (k) usleep(1);
 			#ifdef CHATTER
-			if (k && !flag) logit("   [%d] is retrying the script scan #%d", params->wid, k);
+			logit("\t[%d] searching for script '%s'", params->wid, script);
 			#endif
-			clones = 0;
-			pthread_mutex_lock(&pool->mutex);
-			for (i = 0; i < j; i++) {
-				slot = &pool->slot[i];
-				// do the names match and is it a valid state?
-				if (((!script && !slot->name) ||
-						((script && slot->name) &&
-						(strcmp(script, slot->name) == 0))) &&
-						slot->state) {
-					// count the clones
-					clones++;
-					// is the slot available?
-					if (!slot->status) {
-						// lock it
-						slot->status = STATUS_BUSY;
-						#ifdef CHATTER
-						logit("   [%d] found and locked slot [%d]", params->wid, i);
-						#endif
-						break;
-					}
-				}
-			}
-			pthread_mutex_unlock(&pool->mutex);
-			if ((i == j) && (clones > req.conf->clones)) {
-				// we have max clones running, try again
-				k = -1;
+
+			/* search the pool */
+			found = pool_scan_idle(pool, script);
+			if (found < 0) {
+				/* if we have max clones running, start over */
+				if (abs(found + 1) > req.conf->clones) i = -1;
+				/* give someone else a chance to flag out */
+				usleep(1);
+			} else {
 				#ifdef CHATTER
-				if (!flag) {
-					logit("   [%d] thinks there are enough clones aleady", params->wid);
-					flag = TRUE;
-				}
+				logit("\t[%d] found and locked state [%d]", params->wid, found);
 				#endif
 			}
-		} while ((i == j) && (++k <= req.conf->retries));
+		} while ((found < 0) && (++i <= req.conf->retries));
 
-		if (i < j) {
-			// found a matching state
+		if (found >= 0) {
+			#ifdef CHATTER
+			logit("\t[%d] using state [%d]", params->wid, found);
+			#endif
+			/* found a matching Lua VM state */
+			slot = pool_slot(pool, found);
 			L = slot->state;
 			rc = STATUS_OK;
 		} else {
-			// make a new state
-			//pthread_mutex_lock(&lua_mutex);
+			/* make a new Lua VM state */
 			L = lua_open();
 			if (!L) {
-				logit("[%d] unable to init lua!", params->wid);
+				logit("\t[%d] unable to init lua!", params->wid);
 				return NULL;
 			}
 			luaL_openlibs(L);
@@ -283,195 +322,247 @@ static void *worker_run(void *a) {
 
 			fbuf = script_load(script, &fs);
 
-            if (fbuf) {
-       	        // TODO: run state startup hook
-				// load and run buffer
+			if (fbuf) {
+				#ifdef CHATTER
+				logit("\t[%d] loaded '%s'", params->wid, script, found);
+				#endif
+
+				/* TODO: run state startup hook */
+				/* load and run buffer */
 				rc = luaL_loadbuffer(L, fbuf, fs.st_size, script);
-				if (rc == STATUS_OK) rc = lua_pcall(L, 0, 0, 0);
-				// cleanup
+				if (rc == STATUS_OK)
+					rc = lua_pcall(L, 0, 0, 0);
+				/* cleanup */
 				free(fbuf);
-            }
-			//pthread_mutex_unlock(&lua_mutex);
+			}
 
 			if (rc == STATUS_OK) {
-			    // pick which part of the pool to use
-                pthread_mutex_lock(&pool->mutex);
-                // is there a free spot?
-                for (i = 0; i < j; i++) {
-                	slot = &pool->slot[i];
-                    if (!slot->status && !slot->state) {
-                        slot->status = STATUS_BUSY;
-                        #ifdef CHATTER
-						logit("   [%d] locked free slot [%d]", params->wid, i);
-                        #endif
-                        break;
-                    }
-                }
-                if (i == j) {
-                    // time to kick someone out of the pool :(
-                    // TODO: find a better way to pick a loser
-                    do {
-                        // search for an inactive state
-                        for (i = 0; i < j; i++) {
-                        	slot = &pool->slot[i];
-                            if (!slot->status) {
-                                // found one, so lock it for ourselves
-                                slot->status = STATUS_BUSY;
-								#ifdef CHATTER
-								logit("   [%d] locked inactive slot [%d]", params->wid, i);
-								#endif
-                                break;
-                            }
-                        }
-                        if (i == j) {
-                            // the pool is full & everyone is busy!
-                            // unlock the pool for a bit so someone else can flag out
-                            pthread_mutex_unlock(&pool->mutex);
-                            usleep((int)((rand() % 3) + 1));
-                            pthread_mutex_lock(&pool->mutex);
-                        }
-                    } while (i == j);
-					#ifdef CHATTER
-					logit("   [%d] kicked slot [%d] out of the pool", params->wid, i);
-					#endif
-                }
-                // 'slot' and 'i' should now reference a slot that is locked and free to use
-                pthread_mutex_unlock(&pool->mutex);
-                // scrub it clean and load it up
-                slot_flush(slot);
-                slot_load(slot, L, script);
-				#ifdef CHATTER
-				logit("   [%d] loaded '%s' into slot [%d]", params->wid, script, i);
-				#endif
-            } else {
-            	if (lua_isstring(L, -1)) {
-					// capture the error message
+				/* pick which part of the pool to use */
+				/* grab a free spot, kicking the quietest one out if needed */
+				do {
+					found = pool_scan_free(pool);
+#ifdef CHATTER
+					if (found >= 0) logit("\t[%d] locked free state [%d]", params->wid, found);
+#endif
+					if (found < 0) {
+						/* the pool is full & everyone is busy! */
+						/* wait around for a bit so someone else can flag out */
+						usleep((int) ((rand() % 3) + 1));
+					}
+				} while(found < 0);
+
+				/* load it up */
+				pool_load(pool, found, L, script);
+				slot = pool_slot(pool, found);
+#ifdef CHATTER
+				logit("\t[%d] loaded '%s' into state [%d]", params->wid, script, found);
+#endif
+			} else {
+#ifdef CHATTER
+				logit("\t[%d] '%s' errored out", params->wid, script);
+#endif
+				if (lua_isstring(L, -1)) {
+					/* capture the error message */
 					strncpy(errmsg, lua_tostring(L, -1), ERR_SIZE);
 					errmsg[ERR_SIZE] = '\0';
 					lua_pop(L, 1);
 				}
-				//pthread_mutex_lock(&lua_mutex);
-				if (L) lua_close(L);
-				//pthread_mutex_unlock(&lua_mutex);
-				i = j;
-            }
+				if (L) {
+					lua_close(L);
+					L = NULL;
+				}
+			}
 		}
 
-        if (rc == STATUS_OK) {
-        	// we have a valid VM state, time to roll!
-            lua_getglobal(L, "main");
-            if (lua_isfunction(L, -1)) {
-                // prepare request object
-                req.headers_sent = FALSE;
-                // prepare main() args
-                luaL_pushcgienv(L, &req);
-                luaL_pushrequest(L, &req);
-            	// call script handler
-                rc = lua_pcall(L, 2, 0, 0);
+		if (L) {
+			/* we have a valid VM state, time to roll! */
+#ifdef CHATTER
+			logit("\t[%d] running '%s', Lua stack size = %d", params->wid, script, lua_gettop(L));
+#endif
+			lua_getglobal(L, req.conf->handler);
+			if (lua_isfunction(L, -1)) {
+				/* prepare request object */
+				req.headers_sent = FALSE;
+				/* prepare handler args */
+				luaL_pushcgienv(L, &req);
+				luaL_pushrequest(L, &req);
+				/* call script handler */
+				rc = lua_pcall(L, 2, 0, 0);
 				if (rc == LUA_ERRRUN || rc == LUA_ERRSYNTAX) {
-					// capture the error message
+					/* capture the error message */
 					strncpy(errmsg, lua_tostring(L, -1), ERR_SIZE);
 					errmsg[ERR_SIZE] = '\0';
 					lua_pop(L, 1);
 				}
-            } else {
-                rc = LUA_ERRRUN;
-				strcpy(errmsg, "main() function not found");
-            }
-        }
+			} else {
+				rc = LUA_ERRRUN;
+				sprintf(errmsg, "%s() function not found", req.conf->handler);
+			}
+		}
 
-		// translate for the puny humans
+		/* translate for the puny humans */
 		switch (rc) {
-			case STATUS_OK:
-			case STATUS_404:
-				break;
-			case LUA_ERRFILE:
-				strncpy(errtype, LUA_ERRFILE_STR, ERR_STR_SIZE);
-               	errtype[ERR_STR_SIZE] = '\0';
-				break;
-			case LUA_ERRRUN:
-				strncpy(errtype, LUA_ERRRUN_STR, ERR_STR_SIZE);
-               	errtype[ERR_STR_SIZE] = '\0';
-				break;
-			case LUA_ERRSYNTAX:
-				strncpy(errtype, LUA_ERRSYNTAX_STR, ERR_STR_SIZE);
-               	errtype[ERR_STR_SIZE] = '\0';
-				break;
-			case LUA_ERRMEM:
-				strncpy(errtype, LUA_ERRMEM_STR, ERR_STR_SIZE);
-               	errtype[ERR_STR_SIZE] = '\0';
-				break;
-			default:
-				strncpy(errtype, ERRUNKNOWN_STR, ERR_STR_SIZE);
-               	errtype[ERR_STR_SIZE] = '\0';
-				break;
+		case STATUS_OK:
+		case STATUS_404:
+			break;
+		case LUA_ERRFILE:
+			strncpy(errtype, LUA_ERRFILE_STR, ERR_STR_SIZE);
+			errtype[ERR_STR_SIZE] = '\0';
+			break;
+		case LUA_ERRRUN:
+			strncpy(errtype, LUA_ERRRUN_STR, ERR_STR_SIZE);
+			errtype[ERR_STR_SIZE] = '\0';
+			break;
+		case LUA_ERRSYNTAX:
+			strncpy(errtype, LUA_ERRSYNTAX_STR, ERR_STR_SIZE);
+			errtype[ERR_STR_SIZE] = '\0';
+			break;
+		case LUA_ERRMEM:
+			strncpy(errtype, LUA_ERRMEM_STR, ERR_STR_SIZE);
+			errtype[ERR_STR_SIZE] = '\0';
+			break;
+		default:
+			strncpy(errtype, ERRUNKNOWN_STR, ERR_STR_SIZE);
+			errtype[ERR_STR_SIZE] = '\0';
+			break;
 		};
 
-		// log any errors
-		switch(rc) {
-			case STATUS_OK:
-			case STATUS_404:
-				break;
-			case LUA_ERRRUN:
-			case LUA_ERRSYNTAX:
-				logit("[%d] %s: %s", params->wid, errtype, errmsg);
-				break;
-			case LUA_ERRFILE:
-			case LUA_ERRMEM:
-			default:
-				logit("[%d] %s", params->wid, errtype);
-				break;
+		/* send output, logging any errors */
+		switch (rc) {
+		case STATUS_OK:
+			send_body(&req);
+			break;
+		case STATUS_404:
+			strcpy(req.httpstatus, "404 Not Found");
+			strcpy(req.contenttype, "text/html");
+			send_header(&req);
+			FCGX_FPrintF(req.fcgi.out, HTTP_404, script);
+			break;
+		case LUA_ERRRUN:
+		case LUA_ERRSYNTAX:
+			logit("[%d] %s: %s", params->wid, errtype, errmsg);
+			if (req.conf->showerrors) {
+				strcpy(req.httpstatus, "500 Internal Server Error");
+				strcpy(req.contenttype, "text/html");
+				send_header(&req);
+				FCGX_FPrintF(req.fcgi.out, HTTP_500, errtype, errmsg);
+			}
+			break;
+		case LUA_ERRFILE:
+		case LUA_ERRMEM:
+		default:
+			logit("[%d] %s", params->wid, errtype);
+			if (req.conf->showerrors) {
+				strcpy(req.httpstatus, "500 Internal Server Error");
+				strcpy(req.contenttype, "text/html");
+				send_header(&req);
+				FCGX_FPrintF(req.fcgi.out, HTTP_500, errtype, errmsg);
+			}
+			break;
 		};
 
-        // send the data out the tubes
-        if (rc == STATUS_OK) {
-            if(!req.headers_sent) {
-                FCGX_FPrintF(req.fcgi.out,
-                    "Status: 200 OK\r\n"
-                    "Content-Type: text/html\r\n\r\n"
-                );
-            }
-        } else if (rc == STATUS_404) {
-			HTTP_404(req.fcgi.out, script);
-        } else {
-            HTTP_500(req.fcgi.out, errtype, errmsg);
-        }
+		FCGX_Finish_r(&req.fcgi);
 
-        FCGX_Finish_r(&req.fcgi);
+		if (slot) {
+			/* we are done with the slot, so we shall flag out */
+			pool_lock(pool);
+			slot->status = STATUS_OK;
+			pool_unlock(pool);
+		}
 
-        if (i < j) {
-            // we are done with the slot, so we shall flag out
-            pthread_mutex_lock(&pool->mutex);
-            slot->status = STATUS_OK;
-            pthread_mutex_unlock(&pool->mutex);
-        }
-
-		#ifdef CHATTER
+#ifdef CHATTER
 		logit("[%d] done with request", params->wid);
-		#endif
+#endif
 
-        // cooldown
-        usleep((int)((rand() % 3) + 1));
+		/* release transient memory */
+		buffer_shrink(&req.header, (size_t)params->conf->headersize);
+		buffer_shrink(&req.body, (size_t)params->conf->bodysize);
 
-    }
+		/* cooldown */
+		usleep((int) ((rand() % 3) + 1));
 
-    return NULL;
+	}
+
+	/* release output buffers */
+	buffer_free(&req.body);
+	buffer_free(&req.header);
+
+	return NULL;
 
 }
 
+#ifdef _WIN32
+void daemon(int nochdir, int noclose) {
+	/* No daemon() on Windows - use srvany */
+}
+#endif
+
+#ifdef NO_DAEMON
+/* just in case there are a few older Linux users out there... */
+#include <sys/resource.h>
+#include <fcntl.h>
+void daemon(int nochdir, int noclose) {
+	/* Turn this process into a daemon
+	 * based on work by JOACHIM Jona <jaj@hcl-club.lu>
+	 */
+	pid_t pid;
+	struct rlimit fplim;
+	int i, fd0, fd1, fd2;
+
+	umask(0);
+
+	if((pid = fork()) < 0) {
+		logit("[DAEMON] unable to fork");
+		exit(1);
+	} else if(pid != 0) { /* parent */
+		exit(0);
+	}
+
+	if(setsid() < 0) { /* become a session leader, lose controlling terminal */
+		logit("[DAEMON] setsid error");
+		exit(1);
+	}
+	if(nochdir == 0) {
+		if(chdir("/") < 0) {
+			logit("[DAEMON] chdir error");
+			exit(1);
+		}
+	}
+	if(getrlimit(RLIMIT_NOFILE, &fplim) < 0) {
+		logit("[DAEMON] getrlimit error");
+		exit(1);
+	}
+	for(i = 0; i < fplim.rlim_max; i++) close(i); /* close all open files */
+
+	if(noclose == 0) {
+		/* open stdin, stdout, stderr to /dev/null */
+		fd0 = open("/dev/null", O_RDWR);
+		fd1 = dup(0);
+		fd2 = dup(0);
+
+		/* TODO: initialize syslog */
+
+		if(fd0 != 0 || fd1 != 1 || fd2 != 2) {
+			logit("[DAEMON] unexected file descriptors");
+			exit(1);
+		}
+	}
+}
+#endif
+
 int main(int arc, char** argv) {
 
-    int i, j, sock;
-    pid_t pid = getpid();
-    worker_t* worker = NULL;
+	int i, sock;
+	pid_t pid = getpid();
+	worker_t* worker = NULL;
 	params_t* params = NULL;
 	pool_t* pool = NULL;
 	slot_t* slot = NULL;
-    struct stat fs;
-    config_t* conf = NULL;
-    time_t now;
-    time_t lastsweep;
-    int interval;
+	struct stat fs;
+	config_t* conf = NULL;
+	time_t now;
+	time_t lastsweep;
+	int interval;
 
 	if (arc > 1 && argv[1]) {
 		conf = config_load(argv[1]);
@@ -479,28 +570,37 @@ int main(int arc, char** argv) {
 		conf = config_load("config.lua");
 	}
 
-	// redirect stderr to logfile
-	if (conf->logfile) freopen(conf->logfile, "w", stderr);
+	daemon(0, 0);
 
-    FCGX_Init();
+	// redirect stderr to logfile
+	if (conf->logfile)
+		freopen(conf->logfile, "w", stderr);
+
+	FCGX_Init();
 
 	sock = FCGX_OpenSocket(conf->listen, 100);
-    if (!sock) {
-    	logit("[PARENT] unable to create accept socket!");
-        return 1;
-    }
+	if (!sock) {
+		logit("[PARENT] unable to create accept socket!");
+		return 1;
+	}
 
 	pool = pool_open(conf->states);
 
-    j = conf->workers;
-    // alloc worker data
-	worker = (worker_t*)malloc(sizeof(worker_t) * j);
-	memset(worker, 0, sizeof(worker_t) * j);
-	// alloc worker params
-    params = (params_t*)malloc(sizeof(params_t) * j);
-    memset(params, 0, sizeof(params_t) * j);
+	/* alloc worker data & params */
+	worker = (worker_t*) malloc(sizeof(worker_t) * conf->workers);
+	params = (params_t*) malloc(sizeof(params_t) * conf->workers);
 
-    for (i = 0; i < j; i++) {
+	/* check allocs */
+	if (!worker || !params) {
+		logit("out of memory!");
+		config_free(conf);
+		return 1;
+	}
+
+	memset(worker, 0, sizeof(worker_t) * conf->workers);
+	memset(params, 0, sizeof(params_t) * conf->workers);
+
+	for (i = 0; i < conf->workers; i++) {
 		// initialize worker params
 		params[i].pid = pid;
 		params[i].wid = i;
@@ -508,14 +608,14 @@ int main(int arc, char** argv) {
 		params[i].pool = pool;
 		params[i].conf = conf;
 		// create worker thread
-        pthread_create(&worker[i].tid, NULL, worker_run, (void*)&params[i]);
-        usleep(10);
-    }
+		pthread_create(&worker[i].tid, NULL, worker_run, (void*) &params[i]);
+		usleep(10);
+	}
 
 	lastsweep = time(NULL);
 
-    for (;;) {
-    	// chill till the next sweep
+	for (;;) {
+		// chill till the next sweep
 		usleep(conf->sweep);
 		// how long was the last cycle?
 		now = time(NULL);
@@ -523,41 +623,29 @@ int main(int arc, char** argv) {
 		lastsweep = now;
 		// housekeeping ...
 		// first, we flush any Lua scripts that have been modified
-        pthread_mutex_lock(&pool->mutex);
+		pool_lock(pool);
 		for (i = 0; i < pool->count; i++) {
-			slot = &pool->slot[i];
+			slot = pool_slot(pool, i);
 			// check for stale moon chips
 			if (!slot->status && slot->state && slot->name) {
 				if ((stat(slot->name, &fs) == STATUS_OK) &&
 						(fs.st_mtime > slot->load)) {
-					slot_flush(slot);
-					#ifdef CHATTER
+					pool_flush(pool, i);
+#ifdef CHATTER
 					logit("[%d] has gone stale", i);
-					#endif
+#endif
 				}
 			}
 		}
-        pthread_mutex_unlock(&pool->mutex);
-        // TODO: run housekeeping hook
-    }
+		pool_unlock(pool);
+		// TODO: run housekeeping hook
+	}
 
-    free(params);
+	free(params);
 	free(worker);
 
 	pool_close(pool);
-
-    // dealloc config
-    if (conf->listen) free(conf->listen);
-    for (i = 0; i < HOOK_COUNT; i++) {
-        if (conf->hook[i]) {
-            for (j = 0; j < conf->hook[i]->count; j++) {
-                if (conf->hook[i]->chunk[j]) free(conf->hook[i]->chunk[j]);
-            }
-            free(conf->hook[i]);
-        }
-    }
-    free(conf->hook);
-    free(conf);
+	config_free(conf);
 
 	return 0;
 }
